@@ -1,0 +1,35 @@
+{
+  "name": "proxmox-infrastructure-admin",
+  "version": "0.1.0",
+  "description": "A Tauri-based desktop application for managing Proxmox LXC containers and virtual machines",
+  "main": "dist/index.html",
+  "scripts": {
+    "tauri": "tauri",
+    "dev": "tauri dev",
+    "build": "tauri build"
+  },
+  "keywords": [
+    "proxmox",
+    "lxc",
+    "containers",
+    "virtual-machines",
+    "media-stack",
+    "tauri",
+    "rust",
+    "admin",
+    "infrastructure"
+  ],
+  "author": "Lou Fogle <wlfogle@gmail.com>",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/wlfogle/proxmox-infrastructure-admin.git"
+  },
+  "bugs": {
+    "url": "https://github.com/wlfogle/proxmox-infrastructure-admin/issues"
+  },
+  "homepage": "https://github.com/wlfogle/proxmox-infrastructure-admin#readme",
+  "devDependencies": {
+    "@tauri-apps/cli": "^1.0.0"
+  }
+}
