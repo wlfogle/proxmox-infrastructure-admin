@@ -5,7 +5,6 @@ use std::os::unix::process::ExitStatusExt;
 use std::sync::{Arc, Mutex};
 use std::collections::HashMap;
 use lazy_static::lazy_static;
-use std::io::Write;
 
 // Global cache for data to avoid reloading on tab switches
 lazy_static! {
@@ -119,6 +118,34 @@ struct SystemHealth {
     cpu_load: f64,
     network_status: String,
     uptime: String,
+}
+
+// New structures for automated maintenance and fixing
+#[derive(Debug, Serialize, Deserialize)]
+struct FixResult {
+    success: bool,
+    message: String,
+    actions_taken: Vec<String>,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct InstallResult {
+    success: bool,
+    message: String,
+    installed_items: Vec<String>,
+    failed_items: Vec<String>,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct MaintenanceAction {
+    action_type: String, // "install", "fix", "start", "configure"
+    target: String,      // service/binary/config name
+    container_id: Option<u32>,
+    vm_id: Option<u32>,
+    required: bool,
+    description: String,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -627,7 +654,103 @@ async fn get_existing_vms() -> Result<Vec<u32>, String> {
 
 // System maintenance commands
 
-// Tauri command to get maintenance overview
+// Tauri command to fix all inactive services
+#[tauri::command]
+async fn fix_all_services() -> Result<FixResult, String> {
+    let services = get_all_services().await.unwrap_or_default();
+    let mut actions_taken = Vec::new();
+    let mut success = true;
+
+    for service in services {
+        if !service.active {
+            if let Err(e) = control_service(service.name.clone(), "restart".to_string(), service.container_id, service.vm_id).await {
+                success = false;
+                actions_taken.push(format!("Failed to restart {}: {}", service.name, e));
+            } else {
+                actions_taken.push(format!("Restarted {}", service.name));
+            }
+        }
+    }
+
+    Ok(FixResult {
+        success,
+        message: if success { "All inactive services fixed.".to_string() } else { "Some services failed to fix.".to_string() },
+        actions_taken,
+        timestamp: Utc::now(),
+    })
+}
+
+// Tauri command to check and install missing binaries
+#[tauri::command]
+async fn check_and_install_binaries() -> Result<InstallResult, String> {
+    let mut binaries = Vec::new();
+    
+    // Define binaries to check
+    let binary_definitions = [
+        // System binaries
+        ("docker", None, None),
+        ("systemctl", None, None),
+        ("nginx", None, None),
+        
+        // Application binaries (in containers)
+        ("sonarr", Some(214), None),
+        ("radarr", Some(215), None),
+        ("prowlarr", Some(210), None),
+        ("plex", Some(230), None),
+        ("jellyfin", Some(231), None),
+        
+        // VM binaries
+        ("python3", None, Some(500)),
+        ("hass", None, Some(500)),
+    ];
+    
+    for &(binary_name, container_id, vm_id) in &binary_definitions {
+        if let Ok(binary_info) = check_binary(binary_name.to_string(), container_id, vm_id).await {
+            binaries.push(binary_info);
+        }
+    }
+    
+    let mut install_result = InstallResult {
+        success: true,
+        message: "Installation completed.".to_string(),
+        installed_items: Vec::new(),
+        failed_items: Vec::new(),
+        timestamp: Utc::now(),
+    };
+
+    // Attempt to install missing binaries
+    for binary_info in &binaries {
+        if !binary_info.exists {
+            let install_command = match binary_info.name.as_str() {
+                "nginx" => "apt-get install nginx -y",
+                "docker" => "apt-get install docker.io -y",
+                // Add other install commands here
+                _ => "",
+            };
+
+            if !install_command.is_empty() {
+                let target = get_ssh_target(binary_info.container_id, binary_info.vm_id);
+                let output = Command::new("ssh")
+                    .args([&target, install_command])
+                    .output()
+                    .map_err(|e| format!("Failed to execute installation for {}: {}", binary_info.name, e))?;
+
+                if output.status.success() {
+                    install_result.installed_items.push(binary_info.name.clone());
+                } else {
+                    install_result.failed_items.push(binary_info.name.clone());
+                    install_result.success = false;
+                }
+            }
+        }
+    }
+
+    // Finalize message
+    install_result.message = format!("Installed: {:?}, Failed: {:?}", 
+        install_result.installed_items, install_result.failed_items);
+
+    Ok(install_result)
+}
 #[tauri::command]
 async fn get_maintenance_overview() -> Result<MaintenanceOverview, String> {
     let cache_key = "maintenance_overview";
@@ -697,7 +820,7 @@ async fn check_service_status(service_name: String, container_id: Option<u32>, v
 
 // Tauri command to start/stop/restart service
 #[tauri::command]
-async fn control_service(service_name: String, action: String, container_id: Option<u32>, vm_id: Option<u32>) -> Result<String, String> {
+async fn control_service(service_name: String, action: String, container_id: Option<u32>, vm_id: Option<u32>) -> Result<FixResult, String> {
     let target = get_ssh_target(container_id, vm_id);
     
     let output = Command::new("ssh")
@@ -706,7 +829,12 @@ async fn control_service(service_name: String, action: String, container_id: Opt
         .map_err(|e| format!("Failed to execute SSH command: {}", e))?;
     
     if output.status.success() {
-        Ok(format!("Service {} {} successfully", service_name, action))
+Ok(FixResult {
+        success: true,
+        message: format!("Service {} {} successfully", service_name, action),
+        actions_taken: vec![format!("{} action for service {}", action, service_name)],
+        timestamp: Utc::now(),
+    })
     } else {
         Err(format!("Failed to {} service {}: {}", action, service_name, String::from_utf8_lossy(&output.stderr)))
     }
@@ -998,6 +1126,7 @@ async fn get_all_services() -> Result<Vec<ServiceInfo>, String> {
     
     Ok(services)
 }
+
 
 async fn get_all_binaries() -> Result<Vec<BinaryInfo>, String> {
     let mut binaries = Vec::new();
@@ -1869,7 +1998,8 @@ async fn get_system_overview() -> Result<SystemOverview, String> {
     // VM definitions for metadata
     let vm_metadata = [
         (500, "Home Assistant", "Home automation platform"),
-        (611, "Alexa", "Voice assistant system"),
+        (611, "Ziggy", "Media bridging and streaming VM"),
+        (612, "Bliss OS Android", "Android emulation and testing environment"),
         (900, "AI System", "Artificial intelligence services"),
     ];
 
@@ -1976,7 +2106,8 @@ fn get_container_description(container_id: u32) -> String {
 fn get_vm_name(vm_id: u32) -> String {
     match vm_id {
         500 => "Home Assistant".to_string(),
-        611 => "Alexa".to_string(),
+        611 => "Ziggy".to_string(),
+        612 => "Bliss OS Android".to_string(),
         900 => "AI System".to_string(),
         _ => format!("VM {}", vm_id),
     }
@@ -1985,7 +2116,8 @@ fn get_vm_name(vm_id: u32) -> String {
 fn get_vm_description(vm_id: u32) -> String {
     match vm_id {
         500 => "Home automation platform".to_string(),
-        611 => "Voice assistant system".to_string(),
+        611 => "Media bridging and streaming VM".to_string(),
+        612 => "Android emulation and testing environment".to_string(),
         900 => "Artificial intelligence services".to_string(),
         _ => "Virtual machine".to_string(),
     }
@@ -2236,7 +2368,10 @@ fn main() {
             run_media_services_fix,
             run_hardware_optimization,
             get_performance_metrics,
-            update_duckdns
+            update_duckdns,
+            // Automated maintenance commands
+            check_and_install_binaries,
+            fix_all_services
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
