@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use std::process::Command;
 use chrono::{DateTime, Utc};
+use std::os::unix::process::ExitStatusExt;
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ContainerInfo {
     id: u32,
@@ -392,7 +393,8 @@ async fn check_binary(binary_name: String, container_id: Option<u32>, vm_id: Opt
                 
             if let Ok(output) = find_output {
                 if output.status.success() {
-                    let found_path = String::from_utf8_lossy(&output.stdout).trim();
+                    let found_path_raw = String::from_utf8_lossy(&output.stdout);
+                    let found_path = found_path_raw.trim();
                     if !found_path.is_empty() {
                         exists = true;
                         path = found_path.to_string();
@@ -417,7 +419,7 @@ async fn check_binary(binary_name: String, container_id: Option<u32>, vm_id: Opt
                 let alt_commands = vec!["-v", "-V", "version", "--help"];
                 let mut version_found = "Unknown".to_string();
                 
-                for cmd in &alt_commands {
+                for &cmd in &alt_commands {
                     let alt_output = Command::new("ssh")
                         .args([&target, &path, cmd])
                         .output();
@@ -487,21 +489,33 @@ async fn check_config(config_path: String, container_id: Option<u32>, vm_id: Opt
         let readable_output = Command::new("ssh")
             .args([&target, "test", "-r", &config_path])
             .output()
-            .unwrap_or_default();
+            .unwrap_or_else(|_| std::process::Output {
+                status: std::process::ExitStatus::from_raw(1),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
         let readable = readable_output.status.success();
         
         // Check writable
         let writable_output = Command::new("ssh")
             .args([&target, "test", "-w", &config_path])
             .output()
-            .unwrap_or_default();
+            .unwrap_or_else(|_| std::process::Output {
+                status: std::process::ExitStatus::from_raw(1),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
         let writable = writable_output.status.success();
         
         // Get file stats
         let stat_output = Command::new("ssh")
             .args([&target, "stat", "-c", "%s %Y", &config_path])
             .output()
-            .unwrap_or_default();
+            .unwrap_or_else(|_| std::process::Output {
+                status: std::process::ExitStatus::from_raw(1),
+                stdout: Vec::new(),
+                stderr: Vec::new(),
+            });
         
         let stat_str = String::from_utf8_lossy(&stat_output.stdout);
         let parts: Vec<&str> = stat_str.trim().split_whitespace().collect();
@@ -557,7 +571,7 @@ async fn write_config(config_path: String, content: String, container_id: Option
     let target = get_ssh_target(container_id, vm_id);
     
     // Create a backup first
-    let backup_output = Command::new("ssh")
+    let _backup_output = Command::new("ssh")
         .args([&target, "cp", &config_path, &format!("{}.backup", config_path)])
         .output();
     
@@ -686,7 +700,11 @@ async fn get_system_health() -> Result<SystemHealth, String> {
     let df_output = Command::new("ssh")
         .args(["proxmox", "df", "-h", "/"])
         .output()
-        .unwrap_or_default();
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
     
     let disk_usage = if df_output.status.success() {
         let df_str = String::from_utf8_lossy(&df_output.stdout);
@@ -701,10 +719,14 @@ async fn get_system_health() -> Result<SystemHealth, String> {
     let free_output = Command::new("ssh")
         .args(["proxmox", "free", "-m"])
         .output()
-        .unwrap_or_default();
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
     
     let memory_usage = if free_output.status.success() {
-        let free_str = String::from_utf8_lossy(&free_output.stdout);
+        let _free_str = String::from_utf8_lossy(&free_output.stdout);
         // Parse memory usage from free command output
         50.0 // Placeholder
     } else {
@@ -714,7 +736,11 @@ async fn get_system_health() -> Result<SystemHealth, String> {
     let uptime_output = Command::new("ssh")
         .args(["proxmox", "uptime"])
         .output()
-        .unwrap_or_default();
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
     
     let uptime = if uptime_output.status.success() {
         String::from_utf8_lossy(&uptime_output.stdout).trim().to_string()
