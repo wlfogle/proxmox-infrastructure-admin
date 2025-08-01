@@ -9,6 +9,7 @@ import Containers from './views/Containers.vue'
 import VirtualMachines from './views/VirtualMachines.vue'
 import Maintenance from './views/Maintenance.vue'
 import SystemHealth from './views/SystemHealth.vue'
+import ProxmoxHost from './views/ProxmoxHost.vue'
 
 // Create router
 const router = createRouter({
@@ -19,6 +20,7 @@ const router = createRouter({
     { path: '/vms', name: 'VirtualMachines', component: VirtualMachines },
     { path: '/maintenance', name: 'Maintenance', component: Maintenance },
     { path: '/system', name: 'SystemHealth', component: SystemHealth },
+    { path: '/proxmox-host', name: 'ProxmoxHost', component: ProxmoxHost },
   ]
 })
 

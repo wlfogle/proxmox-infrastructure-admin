@@ -84,7 +84,7 @@
 
 <script>
 import { ref, onMounted } from 'vue'
-import { invoke } from '@tauri-apps/api/tauri'
+import { invoke } from '@tauri-apps/api/core'
 
 export default {
   name: 'Dashboard',

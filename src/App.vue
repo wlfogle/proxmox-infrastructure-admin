@@ -11,6 +11,7 @@
         <router-link to="/vms" class="nav-link">Virtual Machines</router-link>
         <router-link to="/maintenance" class="nav-link">Maintenance</router-link>
         <router-link to="/system" class="nav-link">System Health</router-link>
+        <router-link to="/proxmox-host" class="nav-link">Proxmox Host</router-link>
       </div>
     </nav>
 

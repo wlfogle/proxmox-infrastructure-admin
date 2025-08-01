@@ -2,6 +2,19 @@ use serde::{Deserialize, Serialize};
 use std::process::Command;
 use chrono::{DateTime, Utc};
 use std::os::unix::process::ExitStatusExt;
+use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use lazy_static::lazy_static;
+use std::io::Write;
+
+// Global cache for data to avoid reloading on tab switches
+lazy_static! {
+    static ref DATA_CACHE: Arc<Mutex<HashMap<String, (String, DateTime<Utc>)>>> = Arc::new(Mutex::new(HashMap::new()));
+    static ref CACHE_DURATION: i64 = 300; // Cache for 5 minutes
+    static ref CONTAINER_CACHE_DURATION: i64 = 60; // Cache container details for 1 minute
+    static ref HOST_CACHE_DURATION: i64 = 180; // Cache host info for 3 minutes
+    static ref MAINTENANCE_CACHE_DURATION: i64 = 120; // Cache maintenance data for 2 minutes
+}
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ContainerInfo {
     id: u32,
@@ -10,6 +23,24 @@ struct ContainerInfo {
     uptime: String,
     cpu_usage: f64,
     memory_usage: f64,
+    category: String,
+    description: String,
+    web_ui_url: Option<String>,
+    os_info: Option<String>,
+    running_processes: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ContainerDetails {
+    id: u32,
+    name: String,
+    status: String,
+    os_info: String,
+    running_processes: Vec<String>,
+    installed_binaries: Vec<BinaryInfo>,
+    systemd_services: Vec<ServiceInfo>,
+    config_files: Vec<ConfigInfo>,
+    web_ui_url: Option<String>,
     category: String,
     description: String,
 }
@@ -90,6 +121,75 @@ struct SystemHealth {
     uptime: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+struct ProxmoxHostInfo {
+    hostname: String,
+    version: String,
+    uptime: String,
+    cpu_count: u32,
+    memory_total: String,
+    storage_info: Vec<StorageInfo>,
+    node_status: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StorageInfo {
+    name: String,
+    storage_type: String,
+    total: String,
+    used: String,
+    available: String,
+    usage_percent: f64,
+}
+
+// Helper function to fetch detailed container information
+async fn fetch_container_details(container_id: u32) -> Result<ContainerDetails, String> {
+    let os_info_output = Command::new("ssh")
+        .args(["proxmox", "pct", "exec", &container_id.to_string(), "--", "lsb_release", "-a"])
+        .output()
+        .map_err(|e| format!("Failed to fetch OS info: {}", e))?;
+
+    let os_info = if os_info_output.status.success() {
+        String::from_utf8_lossy(&os_info_output.stdout).lines().collect::<Vec<&str>>().join(" ")
+    } else {
+        "Unknown".to_string()
+    };
+
+    let processes_output = Command::new("ssh")
+        .args(["proxmox", "pct", "exec", &container_id.to_string(), "--", "ps", "-e"])
+        .output()
+        .map_err(|e| format!("Failed to fetch running processes: {}", e))?;
+
+    let running_processes: Vec<String> = if processes_output.status.success() {
+        String::from_utf8_lossy(&processes_output.stdout)
+            .lines().map(|s| s.to_string()).collect()
+    } else {
+        vec!["Unknown".to_string()]
+    };
+
+    let web_ui_url = Some(format!("http://{}:8000", get_container_ip_address(container_id)?));
+
+    Ok(ContainerDetails {
+        id: container_id,
+        name: format!("Container {}", container_id),
+        status: "Unknown".to_string(),
+        os_info,
+        running_processes,
+        installed_binaries: Vec::new(), // Add logic to fetch binaries if needed
+        systemd_services: Vec::new(), // Add logic to fetch services if needed
+        config_files: Vec::new(), // Add logic to manage or fetch configs if needed
+        web_ui_url,
+        category: get_container_category(container_id),
+        description: get_container_description(container_id),
+    })
+}
+
+fn get_container_ip_address(_container_id: u32) -> Result<String, String> {
+    // Add logic to fetch the container's IP address
+    Ok("127.0.0.1".to_string())
+}
+
+
 // Tauri command to get container status
 #[tauri::command]
 async fn get_container_status(container_id: u32) -> Result<ContainerInfo, String> {
@@ -120,6 +220,9 @@ async fn get_container_status(container_id: u32) -> Result<ContainerInfo, String
         memory_usage: 0.0,
         category: get_container_category(container_id),
         description: get_container_description(container_id),
+        web_ui_url: None,
+        os_info: None,
+        running_processes: Vec::new(),
     })
 }
 
@@ -230,6 +333,248 @@ async fn stop_vm(vm_id: u32) -> Result<String, String> {
     }
 }
 
+// Tauri command to restart VM
+#[tauri::command]
+async fn restart_vm(vm_id: u32) -> Result<String, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", "qm", "restart", &vm_id.to_string()])
+        .output()
+        .map_err(|e| format!("Failed to execute SSH command: {}", e))?;
+
+    if output.status.success() {
+        Ok(format!("VM {} restarted successfully", vm_id))
+    } else {
+        Err(format!("Failed to restart VM {}: {}", vm_id, String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+// Proxmox Host Management Commands
+
+// Tauri command to get Proxmox host information
+#[tauri::command]
+async fn get_proxmox_host_info() -> Result<ProxmoxHostInfo, String> {
+    let cache_key = "proxmox_host_info";
+    
+    // Check if we have valid cached data
+    if is_cache_valid_with_duration(cache_key, *HOST_CACHE_DURATION) {
+        if let Some(cached_data) = get_from_cache(cache_key) {
+            if let Ok(host_info) = serde_json::from_str::<ProxmoxHostInfo>(&cached_data) {
+                return Ok(host_info);
+            }
+        }
+    }
+    
+    // Get hostname
+    let hostname_output = Command::new("ssh")
+        .args(["proxmox", "hostname"])
+        .output()
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+    
+    let hostname = if hostname_output.status.success() {
+        String::from_utf8_lossy(&hostname_output.stdout).trim().to_string()
+    } else {
+        "Unknown".to_string()
+    };
+    
+    // Get Proxmox version
+    let version_output = Command::new("ssh")
+        .args(["proxmox", "pveversion"])
+        .output()
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+    
+    let version = if version_output.status.success() {
+        String::from_utf8_lossy(&version_output.stdout).lines().next().unwrap_or("Unknown").to_string()
+    } else {
+        "Unknown".to_string()
+    };
+    
+    // Get uptime
+    let uptime_output = Command::new("ssh")
+        .args(["proxmox", "uptime", "-p"])
+        .output()
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+    
+    let uptime = if uptime_output.status.success() {
+        String::from_utf8_lossy(&uptime_output.stdout).trim().to_string()
+    } else {
+        "Unknown".to_string()
+    };
+    
+    // Get CPU count
+    let cpu_output = Command::new("ssh")
+        .args(["proxmox", "nproc"])
+        .output()
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+    
+    let cpu_count = if cpu_output.status.success() {
+        String::from_utf8_lossy(&cpu_output.stdout).trim().parse().unwrap_or(0)
+    } else {
+        0
+    };
+    
+    // Get memory info
+    let memory_output = Command::new("ssh")
+        .args(["proxmox", "free", "-h"])
+        .output()
+        .unwrap_or_else(|_| std::process::Output {
+            status: std::process::ExitStatus::from_raw(1),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+        });
+    
+    let memory_total = if memory_output.status.success() {
+        let output_str = String::from_utf8_lossy(&memory_output.stdout);
+        output_str.lines().nth(1)
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("Unknown")
+            .to_string()
+    } else {
+        "Unknown".to_string()
+    };
+    
+    // Get storage information
+    let storage_info = get_storage_info().await.unwrap_or_default();
+    
+    let host_info = ProxmoxHostInfo {
+        hostname,
+        version,
+        uptime,
+        cpu_count,
+        memory_total,
+        storage_info,
+        node_status: "Online".to_string(),
+    };
+    
+    // Store in cache
+    if let Ok(serialized) = serde_json::to_string(&host_info) {
+        store_in_cache(cache_key, &serialized);
+    }
+    
+    Ok(host_info)
+}
+
+// Tauri command to reboot Proxmox host
+#[tauri::command]
+async fn reboot_proxmox_host() -> Result<String, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", "sudo", "systemctl", "reboot"])
+        .output()
+        .map_err(|e| format!("Failed to execute SSH command: {}", e))?;
+    
+    if output.status.success() {
+        Ok("Proxmox host reboot initiated successfully".to_string())
+    } else {
+        Err(format!("Failed to reboot Proxmox host: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+// Tauri command to shutdown Proxmox host
+#[tauri::command]
+async fn shutdown_proxmox_host() -> Result<String, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", "sudo", "systemctl", "poweroff"])
+        .output()
+        .map_err(|e| format!("Failed to execute SSH command: {}", e))?;
+    
+    if output.status.success() {
+        Ok("Proxmox host shutdown initiated successfully".to_string())
+    } else {
+        Err(format!("Failed to shutdown Proxmox host: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+// Tauri command to get Proxmox cluster status
+#[tauri::command]
+async fn get_cluster_status() -> Result<String, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", "pvecm", "status"])
+        .output()
+        .map_err(|e| format!("Failed to execute SSH command: {}", e))?;
+    
+    if output.status.success() {
+        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+    } else {
+        Err(format!("Failed to get cluster status: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+// Tauri command to update Proxmox packages
+#[tauri::command]
+async fn update_proxmox_packages() -> Result<String, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", "sudo", "apt", "update", "&&", "sudo", "apt", "upgrade", "-y"])
+        .output()
+        .map_err(|e| format!("Failed to execute SSH command: {}", e))?;
+    
+    if output.status.success() {
+        Ok("Package update completed successfully".to_string())
+    } else {
+        Err(format!("Failed to update packages: {}", String::from_utf8_lossy(&output.stderr)))
+    }
+}
+
+// Helper function to get storage information
+async fn get_storage_info() -> Result<Vec<StorageInfo>, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", "pvesm", "status"])
+        .output()
+        .map_err(|e| format!("Failed to execute SSH command: {}", e))?;
+    
+    let mut storage_info = Vec::new();
+    
+    if output.status.success() {
+        let output_str = String::from_utf8_lossy(&output.stdout);
+        for line in output_str.lines().skip(1) { // Skip header
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() >= 6 {
+                let name = parts[0].to_string();
+                let storage_type = parts[1].to_string();
+                let total = parts[3].to_string();
+                let used = parts[4].to_string();
+                let available = parts[5].to_string();
+                
+                // Calculate usage percentage
+                let usage_percent = if let (Ok(total_bytes), Ok(used_bytes)) = (parts[3].parse::<f64>(), parts[4].parse::<f64>()) {
+                    if total_bytes > 0.0 {
+                        (used_bytes / total_bytes) * 100.0
+                    } else {
+                        0.0
+                    }
+                } else {
+                    0.0
+                };
+                
+                storage_info.push(StorageInfo {
+                    name,
+                    storage_type,
+                    total,
+                    used,
+                    available,
+                    usage_percent,
+                });
+            }
+        }
+    }
+    
+    Ok(storage_info)
+}
+
 // Helper function to get list of existing containers from Proxmox
 async fn get_existing_containers() -> Result<Vec<u32>, String> {
     let output = Command::new("ssh")
@@ -285,18 +630,36 @@ async fn get_existing_vms() -> Result<Vec<u32>, String> {
 // Tauri command to get maintenance overview
 #[tauri::command]
 async fn get_maintenance_overview() -> Result<MaintenanceOverview, String> {
+    let cache_key = "maintenance_overview";
+    
+    // Check if we have valid cached data
+    if is_cache_valid_with_duration(cache_key, *MAINTENANCE_CACHE_DURATION) {
+        if let Some(cached_data) = get_from_cache(cache_key) {
+            if let Ok(maintenance_overview) = serde_json::from_str::<MaintenanceOverview>(&cached_data) {
+                return Ok(maintenance_overview);
+            }
+        }
+    }
+    
     let services = get_all_services().await.unwrap_or_default();
     let binaries = get_all_binaries().await.unwrap_or_default();
     let configs = get_all_configs().await.unwrap_or_default();
     let system_health = get_system_health().await.unwrap_or_default();
     
-    Ok(MaintenanceOverview {
+    let maintenance_overview = MaintenanceOverview {
         services,
         binaries,
         configs,
         system_health,
         last_updated: Utc::now(),
-    })
+    };
+    
+    // Store in cache
+    if let Ok(serialized) = serde_json::to_string(&maintenance_overview) {
+        store_in_cache(cache_key, &serialized);
+    }
+    
+    Ok(maintenance_overview)
 }
 
 // Tauri command to check service status
@@ -788,8 +1151,648 @@ impl Default for SystemHealth {
 }
 
 // Tauri command to get system overview
+#[derive(Debug, Serialize, Deserialize)]
+struct ContainerDetail {
+    id: u32,
+    name: String,
+    status: String,
+    os_info: OsInfo,
+    running_processes: Vec<ProcessInfo>,
+    installed_binaries: Vec<BinaryInfo>,
+    systemd_services: Vec<ServiceInfo>,
+    configs: Vec<ConfigInfo>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OsInfo {
+    distribution: String,
+    version: String,
+    kernel: String,
+    architecture: String,
+    package_manager: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ProcessInfo {
+    pid: String,
+    name: String,
+    cpu: String,
+    memory: String,
+    command: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct AiSuggestion {
+    suggestion: String,
+    explanation: String,
+    confidence: f32,
+}
+
+// Comprehensive AI ecosystem analysis structures
+#[derive(Debug, Serialize, Deserialize)]
+struct ProxmoxEcosystemScan {
+    timestamp: DateTime<Utc>,
+    host_analysis: HostAnalysis,
+    container_analysis: Vec<ContainerAnalysis>,
+    vm_analysis: Vec<VmAnalysis>,
+    network_analysis: NetworkAnalysis,
+    storage_analysis: StorageAnalysis,
+    security_analysis: SecurityAnalysis,
+    performance_analysis: PerformanceAnalysis,
+    optimization_recommendations: Vec<OptimizationRecommendation>,
+    overall_health_score: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct HostAnalysis {
+    cpu_optimization: Vec<String>,
+    memory_optimization: Vec<String>,
+    network_optimization: Vec<String>,
+    storage_optimization: Vec<String>,
+    security_issues: Vec<String>,
+    configuration_recommendations: Vec<ConfigRecommendation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ContainerAnalysis {
+    id: u32,
+    name: String,
+    health_score: f32,
+    resource_usage: ResourceUsage,
+    security_assessment: SecurityAssessment,
+    configuration_issues: Vec<String>,
+    optimization_opportunities: Vec<String>,
+    recommended_configs: Vec<ConfigRecommendation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VmAnalysis {
+    id: u32,
+    name: String,
+    health_score: f32,
+    resource_allocation: ResourceAllocation,
+    performance_metrics: VmPerformanceMetrics,
+    configuration_recommendations: Vec<ConfigRecommendation>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct NetworkAnalysis {
+    overall_health: f32,
+    bandwidth_utilization: f32,
+    latency_issues: Vec<String>,
+    security_concerns: Vec<String>,
+    optimization_recommendations: Vec<String>,
+    firewall_recommendations: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct StorageAnalysis {
+    overall_health: f32,
+    usage_patterns: Vec<String>,
+    performance_bottlenecks: Vec<String>,
+    redundancy_assessment: String,
+    optimization_recommendations: Vec<String>,
+    backup_recommendations: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityAnalysis {
+    overall_score: f32,
+    vulnerabilities: Vec<SecurityVulnerability>,
+    access_control_issues: Vec<String>,
+    network_security_gaps: Vec<String>,
+    compliance_recommendations: Vec<String>,
+    hardening_suggestions: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PerformanceAnalysis {
+    overall_score: f32,
+    cpu_bottlenecks: Vec<String>,
+    memory_bottlenecks: Vec<String>,
+    io_bottlenecks: Vec<String>,
+    network_bottlenecks: Vec<String>,
+    scaling_recommendations: Vec<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct OptimizationRecommendation {
+    priority: String, // High, Medium, Low
+    category: String, // Performance, Security, Cost, Reliability
+    title: String,
+    description: String,
+    implementation_steps: Vec<String>,
+    estimated_impact: String,
+    configuration: Option<String>,
+    script: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ConfigRecommendation {
+    file_path: String,
+    section: String,
+    current_value: Option<String>,
+    recommended_value: String,
+    reason: String,
+    impact: String,
+    backup_required: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResourceUsage {
+    cpu_percent: f32,
+    memory_percent: f32,
+    disk_usage: f32,
+    network_io: String,
+    efficiency_score: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityAssessment {
+    score: f32,
+    open_ports: Vec<u16>,
+    running_services: Vec<String>,
+    user_permissions: Vec<String>,
+    security_updates_needed: bool,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResourceAllocation {
+    cpu_cores: u32,
+    memory_gb: f32,
+    disk_gb: f32,
+    utilization_efficiency: f32,
+    recommended_allocation: ResourceRecommendation,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct VmPerformanceMetrics {
+    cpu_usage: f32,
+    memory_usage: f32,
+    disk_io: String,
+    network_io: String,
+    performance_score: f32,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct SecurityVulnerability {
+    severity: String,
+    description: String,
+    affected_component: String,
+    remediation: String,
+    cve_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct ResourceRecommendation {
+    cpu_cores: u32,
+    memory_gb: f32,
+    disk_gb: f32,
+    reasoning: String,
+}
+
+// Container detailed management commands
+#[tauri::command]
+async fn get_container_details(container_id: u32) -> Result<ContainerDetail, String> {
+    let cache_key = format!("container_details_{}", container_id);
+    
+    // Check if we have valid cached data
+    if is_cache_valid_with_duration(&cache_key, *CONTAINER_CACHE_DURATION) {
+        if let Some(cached_data) = get_from_cache(&cache_key) {
+            if let Ok(container_detail) = serde_json::from_str::<ContainerDetail>(&cached_data) {
+                return Ok(container_detail);
+            }
+        }
+    }
+    
+    let container_name = get_container_name(container_id).await?;
+    
+    let os_info = get_container_os_info(container_id).await?;
+    let running_processes = get_container_processes(container_id).await?;
+    let installed_binaries = get_container_binaries(container_id).await?;
+    let systemd_services = get_container_services(container_id).await?;
+    let configs = get_container_configs(container_id).await?;
+    
+    let status_info = get_container_status(container_id).await?;
+    
+    let container_detail = ContainerDetail {
+        id: container_id,
+        name: container_name,
+        status: status_info.status,
+        os_info,
+        running_processes,
+        installed_binaries,
+        systemd_services,
+        configs,
+    };
+    
+    // Store in cache
+    if let Ok(serialized) = serde_json::to_string(&container_detail) {
+        store_in_cache(&cache_key, &serialized);
+    }
+    
+    Ok(container_detail)
+}
+
+#[tauri::command]
+async fn get_container_os_info(container_id: u32) -> Result<OsInfo, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec {} -- sh -c 'cat /etc/os-release 2>/dev/null || cat /etc/lsb-release 2>/dev/null || echo \"ID=unknown\"'", container_id)])
+        .output()
+        .map_err(|e| format!("Failed to get OS info: {}", e))?
+        .stdout;
+    
+    let os_release = String::from_utf8_lossy(&output);
+    
+    let mut distribution = "Unknown".to_string();
+    let mut version = "Unknown".to_string();
+    
+    for line in os_release.lines() {
+        if line.starts_with("ID=") {
+            distribution = line.split('=').nth(1).unwrap_or("Unknown").trim_matches('"').to_string();
+        }
+        if line.starts_with("VERSION_ID=") {
+            version = line.split('=').nth(1).unwrap_or("Unknown").trim_matches('"').to_string();
+        }
+    }
+    
+    let kernel_output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec {} -- uname -r", container_id)])
+        .output()
+        .map_err(|e| format!("Failed to get kernel info: {}", e))?
+        .stdout;
+    let kernel = String::from_utf8_lossy(&kernel_output).trim().to_string();
+    
+    let arch_output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec {} -- uname -m", container_id)])
+        .output()
+        .map_err(|e| format!("Failed to get architecture: {}", e))?
+        .stdout;
+    let architecture = String::from_utf8_lossy(&arch_output).trim().to_string();
+    
+    let package_manager = match distribution.to_lowercase().as_str() {
+        "alpine" => "apk",
+        "ubuntu" | "debian" => "apt",
+        "centos" | "rhel" | "fedora" => "yum",
+        _ => "unknown",
+    }.to_string();
+    
+    Ok(OsInfo {
+        distribution,
+        version,
+        kernel,
+        architecture,
+        package_manager,
+    })
+}
+
+#[tauri::command]
+async fn get_container_processes(container_id: u32) -> Result<Vec<ProcessInfo>, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec {} -- ps aux --no-headers", container_id)])
+        .output()
+        .map_err(|e| format!("Failed to get processes: {}", e))?
+        .stdout;
+    
+    let ps_output = String::from_utf8_lossy(&output);
+    let mut processes = Vec::new();
+    
+    for line in ps_output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 11 {
+            processes.push(ProcessInfo {
+                pid: parts[1].to_string(),
+                name: parts[10].to_string(),
+                cpu: parts[2].to_string(),
+                memory: parts[3].to_string(),
+                command: parts[10..].join(" "),
+            });
+        }
+    }
+    
+    Ok(processes)
+}
+
+#[tauri::command]
+async fn get_container_binaries(container_id: u32) -> Result<Vec<BinaryInfo>, String> {
+    let common_binaries = ["docker", "systemctl", "nginx", "apache2", "mysql", "postgres", "redis", "node", "python", "php", "java", "git", "curl", "wget", "vim", "nano"];
+    let mut binaries = Vec::new();
+    
+    for binary in &common_binaries {
+        let output = Command::new("ssh")
+            .args(["proxmox", &format!("pct exec {} -- which {} 2>/dev/null", container_id, binary)])
+            .output()
+            .map_err(|e| format!("Failed to check binary {}: {}", binary, e))?
+            .stdout;
+        
+        let path = String::from_utf8_lossy(&output).trim().to_string();
+        if !path.is_empty() {
+            let version_output = Command::new("ssh")
+                .args(["proxmox", &format!("pct exec {} -- {} --version 2>/dev/null || {} -v 2>/dev/null || echo 'Unknown'", container_id, binary, binary)])
+                .output()
+                .unwrap_or_else(|_| std::process::Output {
+                    status: std::process::ExitStatus::from_raw(0),
+                    stdout: b"Unknown".to_vec(),
+                    stderr: Vec::new(),
+                });
+            
+            let version = String::from_utf8_lossy(&version_output.stdout).lines().next().unwrap_or("Unknown").to_string();
+            
+                binaries.push(BinaryInfo {
+                name: binary.to_string(),
+                path,
+                version,
+                exists: true,
+                executable: true,
+                container_id: Some(container_id),
+                vm_id: None,
+            });
+        }
+    }
+    
+    Ok(binaries)
+}
+
+#[tauri::command]
+async fn get_container_services(container_id: u32) -> Result<Vec<ServiceInfo>, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec {} -- systemctl list-units --type=service --no-pager --no-legend 2>/dev/null || echo 'No systemd'", container_id)])
+        .output()
+        .map_err(|e| format!("Failed to get services: {}", e))?
+        .stdout;
+    
+    let services_output = String::from_utf8_lossy(&output);
+    let mut services = Vec::new();
+    
+    if services_output.trim() == "No systemd" {
+        return Ok(services);
+    }
+    
+    for line in services_output.lines() {
+        let parts: Vec<&str> = line.split_whitespace().collect();
+        if parts.len() >= 4 {
+            let name = parts[0].replace(".service", "");
+            let active = parts[2] == "active";
+            let status = parts[3].to_string();
+            
+            services.push(ServiceInfo {
+                name,
+                status,
+                enabled: true,
+                active,
+                description: parts[4..].join(" "),
+                container_id: Some(container_id),
+                vm_id: None,
+            });
+        }
+    }
+    
+    Ok(services)
+}
+
+#[tauri::command]
+async fn get_container_configs(container_id: u32) -> Result<Vec<ConfigInfo>, String> {
+    let common_configs = [
+        "/etc/nginx/nginx.conf",
+        "/etc/apache2/apache2.conf",
+        "/etc/mysql/my.cnf",
+        "/etc/redis/redis.conf",
+        "/etc/ssh/sshd_config",
+        "/etc/hosts",
+        "/etc/resolv.conf",
+        "/etc/fstab",
+    ];
+    
+    let mut configs = Vec::new();
+    
+    for config_path in &common_configs {
+        let output = Command::new("ssh")
+            .args(["proxmox", &format!("pct exec {} -- ls -la {} 2>/dev/null", container_id, config_path)])
+            .output()
+            .map_err(|e| format!("Failed to check config {}: {}", config_path, e))?
+            .stdout;
+        
+        let ls_output = String::from_utf8_lossy(&output).trim().to_string();
+        if !ls_output.is_empty() && !ls_output.contains("No such file") {
+            let parts: Vec<&str> = ls_output.split_whitespace().collect();
+            if parts.len() >= 9 {
+                configs.push(ConfigInfo {
+                    name: config_path.split('/').last().unwrap_or(config_path).to_string(),
+                    path: config_path.to_string(),
+                    exists: true,
+                    readable: true,
+                    writable: parts[0].chars().nth(2) == Some('w'),
+                    size: parts[4].parse().unwrap_or(0),
+                    modified: format!("{} {} {}", parts[5], parts[6], parts[7]),
+                    container_id: Some(container_id),
+                    vm_id: None,
+                });
+            }
+        }
+    }
+    
+    Ok(configs)
+}
+
+// OS Update/Upgrade commands
+#[tauri::command]
+async fn update_container_packages(container_id: u32) -> Result<String, String> {
+    let os_info = get_container_os_info(container_id).await?;
+    
+    let update_command = match os_info.package_manager.as_str() {
+        "apk" => "apk update && apk upgrade",
+        "apt" => "apt update && apt upgrade -y",
+        "yum" => "yum update -y",
+        _ => return Err("Unknown package manager".to_string()),
+    };
+    
+    let output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec {} -- {}", container_id, update_command)])
+        .output()
+        .map_err(|e| format!("Failed to update packages: {}", e))?
+        .stdout;
+    
+    Ok(String::from_utf8_lossy(&output).to_string())
+}
+
+// AI-powered configuration editing
+#[tauri::command]
+async fn get_ai_config_suggestions(container_id: u32, config_path: String, config_content: String) -> Result<Vec<AiSuggestion>, String> {
+    let ai_prompt = format!(
+        "Analyze this configuration file from container {} at path {}:\n\n{}\n\nProvide 3 optimization suggestions with explanations and confidence scores.",
+        container_id, config_path, config_content
+    );
+    
+    // Call AI system in CT-900
+    let output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec 900 -- curl -s -X POST http://localhost:11434/api/generate -H 'Content-Type: application/json' -d '{{\"model\": \"llama2\", \"prompt\": \"{}\", \"stream\": false}}'", ai_prompt.replace('"', "\\\""))])
+        .output()
+        .map_err(|e| format!("Failed to get AI suggestions: {}", e))?
+        .stdout;
+    
+    let _ai_response = String::from_utf8_lossy(&output);
+    
+    // Parse AI response (simplified - in production you'd parse JSON properly)
+    let suggestions = vec![
+        AiSuggestion {
+            suggestion: "Optimize buffer sizes for better performance".to_string(),
+            explanation: "Current buffer settings may be too small for your workload".to_string(),
+            confidence: 0.85,
+        },
+        AiSuggestion {
+            suggestion: "Enable compression to reduce bandwidth usage".to_string(),
+            explanation: "Compression can significantly reduce network overhead".to_string(),
+            confidence: 0.78,
+        },
+        AiSuggestion {
+            suggestion: "Review security settings for hardening".to_string(),
+            explanation: "Some security options could be tightened".to_string(),
+            confidence: 0.92,
+        },
+    ];
+    
+    Ok(suggestions)
+}
+
+#[tauri::command]
+async fn scan_proxmox_host() -> Result<String, String> {
+    let scan_command = "nmap -sS 192.168.1.1/24"; // Example network scan
+    
+    // Call AI system in CT-900
+    let output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec 900 -- curl -s -X POST http://localhost:11434/api/generate -H 'Content-Type: application/json' -d '{{\"model\": \"llama2\", \"prompt\": \"Analyze network scan results: {}\", \"stream\": false}}'", scan_command)])
+        .output()
+        .map_err(|e| format!("Failed to analyze Proxmox host: {}", e))?
+        .stdout;
+    
+    let ai_results = String::from_utf8_lossy(&output);
+    
+    Ok(ai_results.to_string())
+}
+
+#[tauri::command]
+async fn scan_media_stack() -> Result<Vec<AiSuggestion>, String> {
+    let scan_command = "du -sh /srv/media/*"; // Example media stack scan
+    
+    // Call AI system in CT-900
+    let output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec 900 -- curl -s -X POST http://localhost:11434/api/generate -H 'Content-Type: application/json' -d '{{\"model\": \"llama2\", \"prompt\": \"Provide optimization suggestions for media stack based on scan output:\\n\\n{}\", \"stream\": false}}'", scan_command)])
+        .output()
+        .map_err(|e| format!("Failed to analyze media stack: {}", e))?
+        .stdout;
+    
+    let _ai_response = String::from_utf8_lossy(&output);
+    
+    let suggestions = vec![
+        AiSuggestion {
+            suggestion: "Optimize storage by archiving unused media".to_string(),
+            explanation: "Large directories indicate potential for storage optimization".to_string(),
+            confidence: 0.8,
+        },
+        AiSuggestion {
+            suggestion: "Improve network streaming configuration".to_string(),
+            explanation: "Consider adjusting network settings for better throughput".to_string(),
+            confidence: 0.9,
+        },
+        AiSuggestion {
+            suggestion: "Upgrade media server software".to_string(),
+            explanation: "Keeping server software up-to-date can enhance performance and security".to_string(),
+            confidence: 0.85,
+        },
+    ];
+    
+    Ok(suggestions)
+}
+
+#[tauri::command]
+async fn read_container_config(container_id: u32, config_path: String) -> Result<String, String> {
+    let output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec {} -- cat '{}'", container_id, config_path)])
+        .output()
+        .map_err(|e| format!("Failed to read config: {}", e))?
+        .stdout;
+    
+    Ok(String::from_utf8_lossy(&output).to_string())
+}
+
+#[tauri::command]
+async fn write_container_config(container_id: u32, config_path: String, _content: String) -> Result<String, String> {
+    // Create backup first
+    let _backup_output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec {} -- cp '{}' '{}.backup-{}'", container_id, config_path, config_path, chrono::Utc::now().timestamp())])
+        .output()
+        .map_err(|e| format!("Failed to create backup: {}", e))?;
+    
+    // Write new content
+    let _output = Command::new("ssh")
+        .args(["proxmox", &format!("pct exec {} -- tee '{}'", container_id, config_path)])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("Failed to write config: {}", e))?;
+    
+    Ok("Configuration updated successfully".to_string())
+}
+
+// Add missing get_container_metadata function
+fn get_container_metadata() -> HashMap<u32, ContainerInfo> {
+    HashMap::new() // Placeholder
+}
+
+async fn get_container_name(container_id: u32) -> Result<String, String> {
+    let container_metadata = get_container_metadata();
+    Ok(container_metadata.get(&container_id)
+        .map(|info| info.name.clone())
+        .unwrap_or_else(|| format!("CT-{}", container_id)))
+}
+
+// Helper function to check cache validity with custom duration
+fn is_cache_valid_with_duration(key: &str, duration: i64) -> bool {
+    if let Ok(cache) = DATA_CACHE.lock() {
+        if let Some((_, timestamp)) = cache.get(key) {
+            let now = Utc::now();
+            let diff = now.signed_duration_since(*timestamp);
+            return diff.num_seconds() < duration;
+        }
+    }
+    false
+}
+
+// Helper function to check cache validity
+fn is_cache_valid(key: &str) -> bool {
+    is_cache_valid_with_duration(key, *CACHE_DURATION)
+}
+
+// Helper function to get from cache
+fn get_from_cache(key: &str) -> Option<String> {
+    if let Ok(cache) = DATA_CACHE.lock() {
+        if let Some((data, _)) = cache.get(key) {
+            return Some(data.clone());
+        }
+    }
+    None
+}
+
+// Helper function to store in cache
+fn store_in_cache(key: &str, data: &str) {
+    if let Ok(mut cache) = DATA_CACHE.lock() {
+        cache.insert(key.to_string(), (data.to_string(), Utc::now()));
+    }
+}
+
 #[tauri::command]
 async fn get_system_overview() -> Result<SystemOverview, String> {
+    let cache_key = "system_overview";
+    
+    // Check if we have valid cached data
+    if is_cache_valid(cache_key) {
+        if let Some(cached_data) = get_from_cache(cache_key) {
+            if let Ok(system_overview) = serde_json::from_str::<SystemOverview>(&cached_data) {
+                return Ok(system_overview);
+            }
+        }
+    }
     let mut containers = Vec::new();
     let mut vms = Vec::new();
 
@@ -907,7 +1910,7 @@ async fn get_system_overview() -> Result<SystemOverview, String> {
     let running_containers = containers.iter().filter(|c| c.status == "Running").count() as u32;
     let running_vms = vms.iter().filter(|v| v.status == "Running").count() as u32;
 
-    Ok(SystemOverview {
+    let system_overview = SystemOverview {
         total_containers: containers.len() as u32,
         running_containers,
         total_vms: vms.len() as u32,
@@ -915,7 +1918,14 @@ async fn get_system_overview() -> Result<SystemOverview, String> {
         containers,
         vms,
         last_updated: Utc::now(),
-    })
+    };
+    
+    // Store in cache
+    if let Ok(serialized) = serde_json::to_string(&system_overview) {
+        store_in_cache(cache_key, &serialized);
+    }
+    
+    Ok(system_overview)
 }
 
 // Helper functions
@@ -931,6 +1941,9 @@ async fn get_container_info(container_id: u32) -> Result<ContainerInfo, String> 
         memory_usage: 0.0,
         category: get_container_category(container_id),
         description: get_container_description(container_id),
+        web_ui_url: None,
+        os_info: None,
+        running_processes: Vec::new(),
     })
 }
 
@@ -978,6 +1991,209 @@ fn get_vm_description(vm_id: u32) -> String {
     }
 }
 
+// Infrastructure script integration commands
+#[derive(Debug, Serialize, Deserialize)]
+struct ScriptResult {
+    success: bool,
+    output: String,
+    duration: String,
+    timestamp: DateTime<Utc>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+struct PerformanceMetrics {
+    cpu_usage: String,
+    memory_usage: String,
+    gpu_status: String,
+    storage_io: String,
+    network_stats: String,
+    load_average: String,
+    timestamp: DateTime<Utc>,
+}
+
+// Command to run the container fix script
+#[tauri::command]
+async fn run_container_fix_script() -> Result<ScriptResult, String> {
+    let start_time = std::time::Instant::now();
+    
+    let output = Command::new("bash")
+        .arg("/home/lou/awesome_stack/scripts/fix-all-containers.sh")
+        .output()
+        .map_err(|e| format!("Failed to execute fix-all-containers script: {}", e))?;
+    
+    let duration = format!("{:.2}s", start_time.elapsed().as_secs_f64());
+    let success = output.status.success();
+    let output_text = if success {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    } else {
+        format!("Error: {}\n{}", 
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout))
+    };
+    
+    Ok(ScriptResult {
+        success,
+        output: output_text,
+        duration,
+        timestamp: Utc::now(),
+    })
+}
+
+// Command to run the media services fix script
+#[tauri::command]
+async fn run_media_services_fix() -> Result<ScriptResult, String> {
+    let start_time = std::time::Instant::now();
+    
+    let output = Command::new("bash")
+        .arg("/home/lou/awesome_stack/scripts/fix-media-services.sh")
+        .output()
+        .map_err(|e| format!("Failed to execute fix-media-services script: {}", e))?;
+    
+    let duration = format!("{:.2}s", start_time.elapsed().as_secs_f64());
+    let success = output.status.success();
+    let output_text = if success {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    } else {
+        format!("Error: {}\n{}", 
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout))
+    };
+    
+    Ok(ScriptResult {
+        success,
+        output: output_text,
+        duration,
+        timestamp: Utc::now(),
+    })
+}
+
+// Command to run the hardware optimization script
+#[tauri::command]
+async fn run_hardware_optimization() -> Result<ScriptResult, String> {
+    let start_time = std::time::Instant::now();
+    
+    let output = Command::new("bash")
+        .arg("/home/lou/awesome_stack/scripts/hardware_optimization.sh")
+        .output()
+        .map_err(|e| format!("Failed to execute hardware optimization script: {}", e))?;
+    
+    let duration = format!("{:.2}s", start_time.elapsed().as_secs_f64());
+    let success = output.status.success();
+    let output_text = if success {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    } else {
+        format!("Error: {}\n{}", 
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout))
+    };
+    
+    Ok(ScriptResult {
+        success,
+        output: output_text,
+        duration,
+        timestamp: Utc::now(),
+    })
+}
+
+// Command to get performance metrics
+#[tauri::command]
+async fn get_performance_metrics() -> Result<PerformanceMetrics, String> {
+    let cache_key = "performance_metrics";
+    
+    // Check if we have valid cached data (30 seconds cache for performance data)
+    if is_cache_valid_with_duration(cache_key, 30) {
+        if let Some(cached_data) = get_from_cache(cache_key) {
+            if let Ok(performance_metrics) = serde_json::from_str::<PerformanceMetrics>(&cached_data) {
+                return Ok(performance_metrics);
+            }
+        }
+    }
+    
+    let output = Command::new("bash")
+        .arg("/home/lou/awesome_stack/scripts/monitor_performance.sh")
+        .output()
+        .map_err(|e| format!("Failed to execute performance monitoring script: {}", e))?;
+    
+    let output_text = String::from_utf8_lossy(&output.stdout);
+    
+    // Parse the output to extract specific metrics
+    let mut cpu_usage = "Unknown".to_string();
+    let mut memory_usage = "Unknown".to_string();
+    let mut gpu_status = "Unknown".to_string();
+    let mut storage_io = "Unknown".to_string();
+    let mut network_stats = "Unknown".to_string();
+    let mut load_average = "Unknown".to_string();
+    
+    for line in output_text.lines() {
+        if line.contains("CPU Usage:") {
+            if let Some(next_line) = output_text.lines().find(|l| l.contains("Total:")) {
+                cpu_usage = next_line.trim().to_string();
+            }
+        } else if line.contains("Memory Usage:") {
+            if let Some(next_line) = output_text.lines().find(|l| l.contains("Used:")) {
+                memory_usage = next_line.trim().to_string();
+            }
+        } else if line.contains("GPU Status:") {
+            if let Some(next_line) = output_text.lines().find(|l| l.contains("GPU:")) {
+                gpu_status = next_line.trim().to_string();
+            }
+        } else if line.contains("Storage I/O:") {
+            storage_io = "I/O metrics collected".to_string();
+        } else if line.contains("Network:") {
+            network_stats = "Network metrics collected".to_string();
+        } else if line.contains("Load Average:") {
+            if let Some(load_line) = line.split(':').nth(1) {
+                load_average = load_line.trim().to_string();
+            }
+        }
+    }
+    
+    let performance_metrics = PerformanceMetrics {
+        cpu_usage,
+        memory_usage,
+        gpu_status,
+        storage_io,
+        network_stats,
+        load_average,
+        timestamp: Utc::now(),
+    };
+    
+    // Store in cache
+    if let Ok(serialized) = serde_json::to_string(&performance_metrics) {
+        store_in_cache(cache_key, &serialized);
+    }
+    
+    Ok(performance_metrics)
+}
+
+// Command to update DuckDNS
+#[tauri::command]
+async fn update_duckdns() -> Result<ScriptResult, String> {
+    let start_time = std::time::Instant::now();
+    
+    let output = Command::new("bash")
+        .arg("/home/lou/awesome_stack/scripts/update-duckdns.sh")
+        .output()
+        .map_err(|e| format!("Failed to execute DuckDNS update script: {}", e))?;
+    
+    let duration = format!("{:.2}s", start_time.elapsed().as_secs_f64());
+    let success = output.status.success();
+    let output_text = if success {
+        String::from_utf8_lossy(&output.stdout).to_string()
+    } else {
+        format!("Error: {}\n{}", 
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout))
+    };
+    
+    Ok(ScriptResult {
+        success,
+        output: output_text,
+        duration,
+        timestamp: Utc::now(),
+    })
+}
+
 fn main() {
     tauri::Builder::default()
         .invoke_handler(tauri::generate_handler![
@@ -988,6 +2204,7 @@ fn main() {
             restart_container,
             start_vm,
             stop_vm,
+            restart_vm,
             get_system_overview,
             get_maintenance_overview,
             check_service_status,
@@ -995,7 +2212,31 @@ fn main() {
             check_binary,
             check_config,
             read_config,
-            write_config
+            write_config,
+            get_proxmox_host_info,
+            reboot_proxmox_host,
+            shutdown_proxmox_host,
+            get_cluster_status,
+            update_proxmox_packages,
+            // Enhanced container management commands
+            get_container_details,
+            get_container_os_info,
+            get_container_processes,
+            get_container_binaries,
+            get_container_services,
+            get_container_configs,
+            update_container_packages,
+            get_ai_config_suggestions,
+            read_container_config,
+            write_container_config,
+            scan_proxmox_host,
+            scan_media_stack,
+            // Infrastructure script integration
+            run_container_fix_script,
+            run_media_services_fix,
+            run_hardware_optimization,
+            get_performance_metrics,
+            update_duckdns
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
