@@ -3,7 +3,7 @@
     <h1>Container Management</h1>
     <div v-if="loading" class="loading">Loading container information...</div>
     <div v-else>
-      <div v-for="container in containers" :key="container.id" class="container-card">
+      <div v-for="container in filteredAndSortedContainers" :key="container.id" class="container-card">
         <div class="container-header">
           <h3>{{ container.name }}</h3>
           <div class="status-badge" :class="container.status">
@@ -262,14 +262,17 @@ export default {
 
     // Container control functions
     const startContainer = async (id) => {
+      console.log('Starting container:', id)
       await executeContainerOperation(id, 'start', () => invoke('start_container', { container_id: id }))
     }
 
     const stopContainer = async (id) => {
+      console.log('Stopping container:', id)
       await executeContainerOperation(id, 'stop', () => invoke('stop_container', { container_id: id }))
     }
 
     const restartContainer = async (id) => {
+      console.log('Restarting container:', id)
       await executeContainerOperation(id, 'restart', () => invoke('restart_container', { container_id: id }))
     }
 
@@ -295,13 +298,13 @@ export default {
     }
 
     // Service management functions
-    const updateService = async (containerId, serviceName) => {
+    const updateService = async (container_id, serviceName) => {
       try {
-        operationInProgress.value[`${containerId}-${serviceName}`] = true
+        operationInProgress.value[`${container_id}-${serviceName}`] = true
         await invoke('control_service', { 
           service_name: serviceName, 
           action: 'restart',
-          container_id: containerId,
+          container_id: container_id,
           vm_id: null
         })
         await fetchContainers()
@@ -310,15 +313,15 @@ export default {
         console.error(`Failed to update service ${serviceName}:`, error)
         showNotification(`Failed to update service ${serviceName}`, 'error')
       } finally {
-        operationInProgress.value[`${containerId}-${serviceName}`] = false
+        operationInProgress.value[`${container_id}-${serviceName}`] = false
       }
     }
 
-    const checkSystemdService = async (containerId, serviceName) => {
+    const checkSystemdService = async (container_id, serviceName) => {
       try {
         const result = await invoke('check_service_status', {
           service_name: serviceName,
-          container_id: containerId,
+          container_id: container_id,
           vm_id: null
         })
         showNotification(`Service ${serviceName}: ${result.status}`, 'info')
@@ -328,20 +331,20 @@ export default {
       }
     }
 
-    const editServiceConfig = async (containerId, serviceName) => {
-      selectedContainer.value = containers.value.find(c => c.id === containerId)
+    const editServiceConfig = async (container_id, serviceName) => {
+      selectedContainer.value = containers.value.find(c => c.id === container_id)
       selectedConfig.value = serviceName
-      await openConfigEditor(containerId)
+      await openConfigEditor(container_id)
     }
 
     // Configuration management
-    const openConfigEditor = async (containerId) => {
+    const openConfigEditor = async (container_id) => {
       try {
-        selectedContainer.value = containers.value.find(c => c.id === containerId)
+        selectedContainer.value = containers.value.find(c => c.id === container_id)
         showConfigEditor.value = true
         
         // Get available configs for this container
-        const configs = await invoke('get_container_configs', { container_id: containerId })
+        const configs = await invoke('get_container_configs', { container_id: container_id })
         availableConfigs.value = configs.map(c => c.name)
         
         if (availableConfigs.value.length > 0) {
@@ -413,7 +416,7 @@ export default {
       showAISuggestions.value = false
     }
 
-    const applyAIOptimization = async (containerId) => {
+    const applyAIOptimization = async (container_id) => {
       try {
         const result = await invoke('scan_media_stack')
         showNotification('AI optimization applied successfully', 'success')
@@ -486,6 +489,33 @@ export default {
     const showNotification = (message, type = 'info') => {
       // This would show a toast notification
       console.log(`[${type.toUpperCase()}] ${message}`)
+      
+      // Create a simple notification element
+      const notification = document.createElement('div')
+      notification.className = `notification notification-${type}`
+      notification.textContent = message
+      notification.style.cssText = `
+        position: fixed;
+        top: 20px;
+        right: 20px;
+        padding: 12px 24px;
+        border-radius: 4px;
+        color: white;
+        font-weight: 500;
+        z-index: 1000;
+        max-width: 400px;
+        word-wrap: break-word;
+        background-color: ${type === 'success' ? '#10b981' : type === 'error' ? '#ef4444' : type === 'warning' ? '#f59e0b' : '#3b82f6'};
+      `
+      
+      document.body.appendChild(notification)
+      
+      // Remove after 5 seconds
+      setTimeout(() => {
+        if (notification.parentNode) {
+          notification.parentNode.removeChild(notification)
+        }
+      }, 5000)
     }
 
     const generateMockContainers = () => {
@@ -493,15 +523,64 @@ export default {
       return [
         {
           id: 210, name: 'Prowlarr', status: 'running', category: 'Essential Media Services',
-          description: 'Indexer manager and proxy', os_info: 'Alpine Linux',
-          architecture: 'x86_64', services: [{name: 'prowlarr', status: 'active'}],
-          cpu_usage: 15.2, memory_usage: 256, uptime: '2d 5h 30m'
+          description: 'Indexer manager and proxy', os_info: 'Alpine Linux 3.18',
+          architecture: 'x86_64', 
+          image: 'Alpine Linux:3.18',
+          services: [
+            {name: 'prowlarr', status: 'active'},
+            {name: 'nginx', status: 'active'}
+          ],
+          cpu_usage: 15.2, memory_usage: 256, uptime: '2d 5h 30m',
+          created: new Date(Date.now() - 86400000 * 2).toISOString()
         },
         {
           id: 214, name: 'Sonarr', status: 'running', category: 'Essential Media Services',
           description: 'TV series management', os_info: 'Ubuntu 22.04',
-          architecture: 'x86_64', services: [{name: 'sonarr', status: 'active'}],
-          cpu_usage: 8.7, memory_usage: 512, uptime: '1d 12h 45m'
+          architecture: 'x86_64',
+          image: 'Ubuntu:22.04',
+          services: [
+            {name: 'sonarr', status: 'active'},
+            {name: 'systemd-resolved', status: 'active'}
+          ],
+          cpu_usage: 8.7, memory_usage: 512, uptime: '1d 12h 45m',
+          created: new Date(Date.now() - 86400000 * 1).toISOString()
+        },
+        {
+          id: 215, name: 'Radarr', status: 'running', category: 'Essential Media Services',
+          description: 'Movie collection manager', os_info: 'Ubuntu 22.04',
+          architecture: 'x86_64',
+          image: 'Ubuntu:22.04',
+          services: [
+            {name: 'radarr', status: 'active'},
+            {name: 'systemd-resolved', status: 'active'}
+          ],
+          cpu_usage: 12.3, memory_usage: 384, uptime: '3d 8h 15m',
+          created: new Date(Date.now() - 86400000 * 3).toISOString()
+        },
+        {
+          id: 216, name: 'Jellyfin', status: 'running', category: 'Media Server',
+          description: 'Media streaming server', os_info: 'Debian 12',
+          architecture: 'x86_64',
+          image: 'Debian:12',
+          services: [
+            {name: 'jellyfin', status: 'active'},
+            {name: 'systemd-resolved', status: 'active'},
+            {name: 'cron', status: 'inactive'}
+          ],
+          cpu_usage: 25.6, memory_usage: 1024, uptime: '5d 2h 22m',
+          created: new Date(Date.now() - 86400000 * 5).toISOString()
+        },
+        {
+          id: 217, name: 'qBittorrent', status: 'stopped', category: 'Download Clients',
+          description: 'BitTorrent client', os_info: 'Alpine Linux 3.18',
+          architecture: 'x86_64',
+          image: 'Alpine Linux:3.18',
+          services: [
+            {name: 'qbittorrent-nox', status: 'inactive'},
+            {name: 'nginx', status: 'inactive'}
+          ],
+          cpu_usage: 0, memory_usage: 0, uptime: '0 minutes',
+          created: new Date(Date.now() - 86400000 * 7).toISOString()
         }
       ]
     }
@@ -565,22 +644,417 @@ export default {
 <style scoped>
 .containers {
   padding: 20px;
+  max-width: 1200px;
+  margin: 0 auto;
 }
 
-button {
-  margin-right: 5px;
+.loading {
+  text-align: center;
+  padding: 40px;
+  font-size: 18px;
+  color: #666;
 }
-table {
+
+.container-card {
+  background: rgba(255, 255, 255, 0.95);
+  backdrop-filter: blur(10px);
+  border-radius: 12px;
+  padding: 24px;
+  margin-bottom: 24px;
+  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.1);
+  transition: transform 0.2s ease, box-shadow 0.2s ease;
+}
+
+.container-card:hover {
+  transform: translateY(-2px);
+  box-shadow: 0 8px 30px rgba(0, 0, 0, 0.15);
+}
+
+.container-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+  padding-bottom: 16px;
+  border-bottom: 2px solid #e5e7eb;
+}
+
+.container-header h3 {
+  color: #1f2937;
+  font-size: 20px;
+  font-weight: 600;
+  margin: 0;
+}
+
+.status-badge {
+  padding: 6px 12px;
+  border-radius: 20px;
+  font-size: 12px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.status-badge.Running {
+  background-color: #10b981;
+  color: white;
+}
+
+.status-badge.Stopped {
+  background-color: #ef4444;
+  color: white;
+}
+
+.status-badge.Unknown {
+  background-color: #6b7280;
+  color: white;
+}
+
+.container-details {
+  margin-bottom: 24px;
+}
+
+.detail-section {
+  margin-bottom: 20px;
+}
+
+.detail-section h4 {
+  color: #374151;
+  font-size: 16px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  border-left: 4px solid #667eea;
+  padding-left: 12px;
+}
+
+.detail-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 12px;
+}
+
+.detail-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.detail-item label {
+  font-weight: 600;
+  color: #4b5563;
+  min-width: 80px;
+}
+
+.detail-item span {
+  color: #1f2937;
+  font-family: 'Courier New', monospace;
+  font-size: 14px;
+}
+
+.services-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.service-item {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 12px;
+  background: #f9fafb;
+  border-radius: 8px;
+  border: 1px solid #e5e7eb;
+}
+
+.service-info {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+}
+
+.service-name {
+  font-weight: 600;
+  color: #1f2937;
+}
+
+.service-status {
+  padding: 4px 8px;
+  border-radius: 12px;
+  font-size: 11px;
+  font-weight: 600;
+  text-transform: uppercase;
+}
+
+.service-status.active {
+  background-color: #dcfce7;
+  color: #166534;
+}
+
+.service-status.inactive {
+  background-color: #fef2f2;
+  color: #991b1b;
+}
+
+.service-actions {
+  display: flex;
+  gap: 6px;
+}
+
+.no-services {
+  color: #6b7280;
+  font-style: italic;
+  text-align: center;
+  padding: 20px;
+}
+
+.container-actions {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+  gap: 20px;
+}
+
+.action-group {
+  background: #f8fafc;
+  border-radius: 8px;
+  padding: 16px;
+  border: 1px solid #e2e8f0;
+}
+
+.action-group h5 {
+  color: #475569;
+  font-size: 14px;
+  font-weight: 600;
+  margin-bottom: 12px;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.btn {
+  padding: 8px 16px;
+  border: none;
+  border-radius: 6px;
+  font-size: 14px;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 0.2s ease;
+  margin: 4px 4px 4px 0;
+  min-width: 80px;
+}
+
+.btn:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+.btn-success {
+  background-color: #10b981;
+  color: white;
+}
+
+.btn-success:hover:not(:disabled) {
+  background-color: #059669;
+}
+
+.btn-danger {
+  background-color: #ef4444;
+  color: white;
+}
+
+.btn-danger:hover:not(:disabled) {
+  background-color: #dc2626;
+}
+
+.btn-warning {
+  background-color: #f59e0b;
+  color: white;
+}
+
+.btn-warning:hover:not(:disabled) {
+  background-color: #d97706;
+}
+
+.btn-primary {
+  background-color: #3b82f6;
+  color: white;
+}
+
+.btn-primary:hover:not(:disabled) {
+  background-color: #2563eb;
+}
+
+.btn-secondary {
+  background-color: #6b7280;
+  color: white;
+}
+
+.btn-secondary:hover:not(:disabled) {
+  background-color: #4b5563;
+}
+
+.btn-info {
+  background-color: #06b6d4;
+  color: white;
+}
+
+.btn-info:hover:not(:disabled) {
+  background-color: #0891b2;
+}
+
+.btn-special {
+  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+  color: white;
+}
+
+.btn-special:hover:not(:disabled) {
+  background: linear-gradient(135deg, #5a67d8 0%, #6b46c1 100%);
+}
+
+.btn-small {
+  padding: 4px 8px;
+  font-size: 12px;
+  min-width: 60px;
+}
+
+/* Modal Styles */
+.modal-overlay {
+  position: fixed;
+  top: 0;
+  left: 0;
   width: 100%;
-  border-collapse: collapse;
-  margin-top: 20px;
+  height: 100%;
+  background-color: rgba(0, 0, 0, 0.5);
+  display: flex;
+  justify-content: center;
+  align-items: center;
+  z-index: 1000;
 }
-th, td {
-  border: 1px solid #ddd;
-  padding: 8px;
+
+.modal-content {
+  background: white;
+  border-radius: 12px;
+  width: 90%;
+  max-width: 800px;
+  max-height: 80%;
+  display: flex;
+  flex-direction: column;
 }
-th {
-  background-color: #f2f2f2;
+
+.modal-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  padding: 20px;
+  border-bottom: 1px solid #e5e7eb;
+}
+
+.modal-header h3 {
+  margin: 0;
+  color: #1f2937;
+}
+
+.close-btn {
+  background: none;
+  border: none;
+  font-size: 24px;
+  cursor: pointer;
+  color: #6b7280;
+  padding: 0;
+  width: 30px;
+  height: 30px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+}
+
+.close-btn:hover {
+  color: #374151;
+}
+
+.modal-body {
+  padding: 20px;
+  flex: 1;
+  overflow-y: auto;
+}
+
+.config-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+  flex-wrap: wrap;
+}
+
+.tab-btn {
+  padding: 8px 16px;
+  border: 1px solid #d1d5db;
+  background: #f9fafb;
+  border-radius: 6px;
+  cursor: pointer;
+  font-size: 14px;
+  transition: all 0.2s ease;
+}
+
+.tab-btn:hover {
+  background: #e5e7eb;
+}
+
+.tab-btn.active {
+  background: #3b82f6;
+  color: white;
+  border-color: #3b82f6;
+}
+
+.config-editor {
+  margin-bottom: 20px;
+}
+
+.config-textarea {
+  width: 100%;
+  height: 300px;
+  font-family: 'Courier New', monospace;
+  font-size: 13px;
+  border: 1px solid #d1d5db;
+  border-radius: 6px;
+  padding: 12px;
+  resize: vertical;
+}
+
+.modal-actions {
+  display: flex;
+  gap: 12px;
+  justify-content: flex-end;
+  padding-top: 16px;
+  border-top: 1px solid #e5e7eb;
+}
+
+@media (max-width: 768px) {
+  .containers {
+    padding: 12px;
+  }
+  
+  .container-card {
+    padding: 16px;
+  }
+  
+  .container-actions {
+    grid-template-columns: 1fr;
+  }
+  
+  .detail-grid {
+    grid-template-columns: 1fr;
+  }
+  
+  .modal-content {
+    width: 95%;
+    margin: 10px;
+  }
 }
 </style>
 
